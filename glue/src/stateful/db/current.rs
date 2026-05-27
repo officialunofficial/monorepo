@@ -783,6 +783,61 @@ where
     }
 }
 
+impl<F, E, K, V, H, T, R, const N: usize, S> StateSyncDb<E, R>
+    for Db<
+        F,
+        E,
+        VariableJournal<E, Operation<F, ordered::Update<K, VariableEncoding<V>>>>,
+        OrderedIdx<T, Location<F>>,
+        H,
+        ordered::Update<K, VariableEncoding<V>>,
+        N,
+        S,
+    >
+where
+    F: Graftable,
+    E: Storage + Clock + Metrics,
+    K: Key,
+    V: value::VariableValue + 'static,
+    H: Hasher,
+    T: Translator,
+    S: Strategy,
+    Operation<F, ordered::Update<K, VariableEncoding<V>>>: Codec,
+    R: Resolver<
+            Family = F,
+            Op = Operation<F, ordered::Update<K, VariableEncoding<V>>>,
+            Digest = H::Digest,
+        >,
+{
+    type SyncError = sync::Error<F, R::Error, H::Digest>;
+
+    async fn sync_db(
+        context: E,
+        config: Self::Config,
+        resolver: R,
+        target: Self::SyncTarget,
+        tip_updates: mpsc::Receiver<Self::SyncTarget>,
+        finish: Option<mpsc::Receiver<()>>,
+        reached_target: Option<mpsc::Sender<Self::SyncTarget>>,
+        sync_config: SyncEngineConfig,
+    ) -> Result<Self, Self::SyncError> {
+        sync::sync(sync::engine::Config {
+            context,
+            resolver,
+            target,
+            max_outstanding_requests: sync_config.max_outstanding_requests,
+            fetch_batch_size: sync_config.fetch_batch_size,
+            apply_batch_size: sync_config.apply_batch_size,
+            db_config: config,
+            update_rx: Some(tip_updates),
+            finish_rx: finish,
+            reached_target_tx: reached_target,
+            max_retained_roots: sync_config.max_retained_roots,
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
