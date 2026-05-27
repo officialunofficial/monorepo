@@ -15,32 +15,33 @@ use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
+    Persistable,
     index::{
-        unordered::Index as UnorderedIdx, Ordered as OrderedIndex, Unordered as UnorderedIndex,
+        Ordered as OrderedIndex, Unordered as UnorderedIndex, ordered::Index as OrderedIdx,
+        unordered::Index as UnorderedIdx,
     },
     journal::contiguous::{
-        fixed::Journal as FixedJournal, variable::Journal as VariableJournal, Contiguous, Mutable,
+        Contiguous, Mutable, fixed::Journal as FixedJournal, variable::Journal as VariableJournal,
     },
     merkle::{Graftable, Location},
     qmdb::{
+        Error,
         any::{
             operation::{Operation, Update},
             ordered, unordered,
             value::{self, FixedEncoding, ValueEncoding, VariableEncoding},
         },
         current::{
+            FixedConfig, VariableConfig,
             batch::{MerkleizedBatch, UnmerkleizedBatch},
             db::Db,
-            FixedConfig, VariableConfig,
         },
         operation::Key,
-        sync::{self, resolver::Resolver, Target as CurrentSyncTarget},
-        Error,
+        sync::{self, Target as CurrentSyncTarget, resolver::Resolver},
     },
     translator::Translator,
-    Persistable,
 };
-use commonware_utils::{channel::mpsc, non_empty_range, sync::AsyncRwLock, Array};
+use commonware_utils::{Array, channel::mpsc, non_empty_range, sync::AsyncRwLock};
 use std::{ops::Deref, sync::Arc};
 
 type CurrentDbHandle<F, E, C, I, H, U, const N: usize, S> =
@@ -423,13 +424,16 @@ mod open {
     use commonware_storage::{
         merkle::Graftable,
         qmdb::{
+            Error,
             any::{
                 operation::Operation,
-                unordered,
+                ordered, unordered,
                 value::{VariableEncoding, VariableValue},
             },
-            current::{unordered::variable::Db, VariableConfig},
-            Error,
+            current::{
+                VariableConfig, ordered::variable::Db as OrderedDb, unordered::variable::Db,
+            },
+            operation::Key,
         },
     };
     use commonware_utils::Array;
@@ -455,6 +459,26 @@ mod open {
         Operation<F, unordered::Update<K, VariableEncoding<V>>>: Codec,
     {
         Db::init(context, config).await
+    }
+
+    type OrderedVConfig<T, F, K, V, S> =
+        VariableConfig<T, <Operation<F, ordered::Update<K, VariableEncoding<V>>> as Read>::Cfg, S>;
+
+    pub(super) async fn ordered_variable<F, E, K, V, H, T, const N: usize, S>(
+        context: E,
+        config: OrderedVConfig<T, F, K, V, S>,
+    ) -> Result<OrderedDb<F, E, K, V, H, T, N, S>, Error<F>>
+    where
+        F: Graftable,
+        E: Storage + Clock + Metrics,
+        K: Key,
+        V: VariableValue + 'static,
+        H: Hasher,
+        T: commonware_storage::translator::Translator,
+        S: Strategy,
+        Operation<F, ordered::Update<K, VariableEncoding<V>>>: Codec,
+    {
+        OrderedDb::init(context, config).await
     }
 }
 
@@ -554,6 +578,102 @@ where
     }
 }
 
+/// Implement [`ManagedDb`] for ordered current QMDB databases with variable-size values.
+impl<F, E, K, V, H, T, const N: usize, S> ManagedDb<E>
+    for Db<
+        F,
+        E,
+        VariableJournal<E, Operation<F, ordered::Update<K, VariableEncoding<V>>>>,
+        OrderedIdx<T, Location<F>>,
+        H,
+        ordered::Update<K, VariableEncoding<V>>,
+        N,
+        S,
+    >
+where
+    F: Graftable,
+    E: Storage + Clock + Metrics,
+    K: Key,
+    V: value::VariableValue + 'static,
+    H: Hasher,
+    T: Translator,
+    S: Strategy,
+    Operation<F, ordered::Update<K, VariableEncoding<V>>>: Codec,
+{
+    type Unmerkleized = CurrentUnmerkleized<
+        F,
+        E,
+        VariableJournal<E, Operation<F, ordered::Update<K, VariableEncoding<V>>>>,
+        OrderedIdx<T, Location<F>>,
+        H,
+        ordered::Update<K, VariableEncoding<V>>,
+        N,
+        S,
+    >;
+    type Merkleized = CurrentMerkleized<
+        F,
+        E,
+        VariableJournal<E, Operation<F, ordered::Update<K, VariableEncoding<V>>>>,
+        OrderedIdx<T, Location<F>>,
+        H,
+        ordered::Update<K, VariableEncoding<V>>,
+        N,
+        S,
+    >;
+    type Error = Error<F>;
+    type Config = VariableConfig<
+        T,
+        <Operation<F, ordered::Update<K, VariableEncoding<V>>> as CodecRead>::Cfg,
+        S,
+    >;
+    type SyncTarget = CurrentSyncTarget<F, H::Digest>;
+
+    async fn init(context: E, config: Self::Config) -> Result<Self, Error<F>> {
+        open::ordered_variable(context, config).await
+    }
+
+    async fn new_batch(db: &Arc<AsyncRwLock<Self>>) -> Self::Unmerkleized {
+        let inner = db.read().await;
+        CurrentUnmerkleized {
+            batch: inner.new_batch(),
+            db: db.clone(),
+            metadata: None,
+        }
+    }
+
+    fn matches_sync_target(batch: &Self::Merkleized, target: &Self::SyncTarget) -> bool {
+        batch.ops_root() == target.root
+            && *target.range.start() == batch.sync_boundary()
+            && *target.range.end() == Location::<F>::new(batch.bounds().total_size)
+    }
+
+    async fn finalize(&mut self, batch: Self::Merkleized) -> Result<(), Error<F>> {
+        self.apply_batch(batch.inner).await?;
+        self.sync().await?;
+        Ok(())
+    }
+
+    async fn sync_target(&self) -> Self::SyncTarget {
+        let bounds = self.bounds().await;
+        CurrentSyncTarget {
+            root: self.ops_root(),
+            range: non_empty_range!(self.sync_boundary(), bounds.end),
+        }
+    }
+
+    async fn rewind_to_target(&mut self, target: Self::SyncTarget) -> Result<(), Error<F>> {
+        self.rewind(target.range.end()).await?;
+        self.sync().await?;
+
+        let rewound_target = self.sync_target().await;
+        assert_eq!(
+            rewound_target, target,
+            "rewound database target mismatch after rewind",
+        );
+        Ok(())
+    }
+}
+
 impl<F, E, K, V, H, T, R, const N: usize, S> StateSyncDb<E, R>
     for Db<
         F,
@@ -574,10 +694,10 @@ where
     T: Translator,
     S: Strategy,
     R: Resolver<
-        Family = F,
-        Op = Operation<F, unordered::Update<K, FixedEncoding<V>>>,
-        Digest = H::Digest,
-    >,
+            Family = F,
+            Op = Operation<F, unordered::Update<K, FixedEncoding<V>>>,
+            Digest = H::Digest,
+        >,
 {
     type SyncError = sync::Error<F, R::Error, H::Digest>;
 
@@ -629,10 +749,10 @@ where
     S: Strategy,
     Operation<F, unordered::Update<K, VariableEncoding<V>>>: Codec,
     R: Resolver<
-        Family = F,
-        Op = Operation<F, unordered::Update<K, VariableEncoding<V>>>,
-        Digest = H::Digest,
-    >,
+            Family = F,
+            Op = Operation<F, unordered::Update<K, VariableEncoding<V>>>,
+            Digest = H::Digest,
+        >,
 {
     type SyncError = sync::Error<F, R::Error, H::Digest>;
 
@@ -666,10 +786,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{sha256::Digest, Sha256};
+    use commonware_cryptography::{Sha256, sha256::Digest};
     use commonware_parallel::Sequential;
     use commonware_runtime::{
-        buffer::paged::CacheRef, deterministic, BufferPooler, Runner as _, Supervisor as _,
+        BufferPooler, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
     };
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
@@ -677,7 +797,7 @@ mod tests {
         qmdb::current::unordered::fixed,
         translator::TwoCap,
     };
-    use commonware_utils::{non_empty_range, NZUsize, NZU16, NZU64};
+    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use std::num::{NonZeroU16, NonZeroUsize};
 
     type FixedDb = fixed::Db<
