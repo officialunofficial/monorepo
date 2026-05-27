@@ -3,19 +3,20 @@
 //! Wraps the [`any::batch`] API.
 
 use crate::{
+    Context,
     index::Unordered as UnorderedIndex,
     journal::contiguous::{Contiguous, Mutable},
     merkle::{
-        self, batch::MerkleizedBatch as GenericMerkleizedBatch, mem::Mem,
-        storage::Storage as MerkleStorage, Graftable, Location, Position, Readable,
+        self, Graftable, Location, Position, Readable,
+        batch::MerkleizedBatch as GenericMerkleizedBatch, mem::Mem,
+        storage::Storage as MerkleStorage,
     },
     qmdb::{
-        self,
+        self, Error,
         any::{
-            self,
-            batch::{lookup_sorted, DiffEntry},
-            operation::{update, Operation},
-            ValueEncoding,
+            self, ValueEncoding,
+            batch::{DiffEntry, lookup_sorted},
+            operation::{Operation, update},
         },
         batch_chain::Bounds,
         bitmap::Shared,
@@ -24,9 +25,7 @@ use crate::{
             grafting,
         },
         operation::Key,
-        Error,
     },
-    Context,
 };
 use ahash::AHasher;
 use commonware_codec::Codec;
@@ -34,7 +33,7 @@ use commonware_cryptography::{Digest, Hasher};
 use commonware_parallel::Strategy;
 use commonware_utils::bitmap::{self, Readable as _};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     hash::BuildHasherDefault,
     sync::Arc,
 };
@@ -164,12 +163,12 @@ struct BatchStorageAdapter<
 }
 
 impl<
-        'a,
-        F: Graftable,
-        D: Digest,
-        R: Readable<Family = F, Digest = D, Error = merkle::Error<F>>,
-        S: MerkleStorage<F, Digest = D>,
-    > BatchStorageAdapter<'a, F, D, R, S>
+    'a,
+    F: Graftable,
+    D: Digest,
+    R: Readable<Family = F, Digest = D, Error = merkle::Error<F>>,
+    S: MerkleStorage<F, Digest = D>,
+> BatchStorageAdapter<'a, F, D, R, S>
 {
     const fn new(batch: &'a R, base: &'a S) -> Self {
         Self {
@@ -181,11 +180,11 @@ impl<
 }
 
 impl<
-        F: Graftable,
-        D: Digest,
-        R: Readable<Family = F, Digest = D, Error = merkle::Error<F>>,
-        S: MerkleStorage<F, Digest = D>,
-    > MerkleStorage<F> for BatchStorageAdapter<'_, F, D, R, S>
+    F: Graftable,
+    D: Digest,
+    R: Readable<Family = F, Digest = D, Error = merkle::Error<F>>,
+    S: MerkleStorage<F, Digest = D>,
+> MerkleStorage<F> for BatchStorageAdapter<'_, F, D, R, S>
 {
     type Digest = D;
 
@@ -337,6 +336,18 @@ where
     pub fn write(mut self, key: U::Key, value: Option<U::Value>) -> Self {
         self.inner = self.inner.write(key, value);
         self
+    }
+
+    /// The batch's effective pending overlay relative to committed DB state:
+    /// every key written by this batch or an uncommitted ancestor, mapped to
+    /// `Some(value)` (upsert) or `None` (delete that hides a committed entry).
+    ///
+    /// A prefix scan over the parent-anchored state is the committed DB's range
+    /// stream overlaid with this map (pending upsert shadows the committed
+    /// value; pending delete hides it). Resolves with the same read priority as
+    /// [`get`](Self::get).
+    pub fn pending_overlay(&self) -> BTreeMap<U::Key, Option<U::Value>> {
+        self.inner.pending_overlay()
     }
 }
 
@@ -590,7 +601,9 @@ where
     let graftable_parent = *grafted_parent.leaves() as usize;
     let pruned_chunks = bitmap_parent.pruned_chunks();
     assert!(
-        pruned_chunks <= graftable_parent && graftable_parent <= graftable_overlay && graftable_overlay <= new_complete_chunks,
+        pruned_chunks <= graftable_parent
+            && graftable_parent <= graftable_overlay
+            && graftable_overlay <= new_complete_chunks,
         "invariant violated: pruned={pruned_chunks} graftable_parent={graftable_parent} graftable_overlay={graftable_overlay} new_complete={new_complete_chunks}"
     );
 
@@ -926,12 +939,12 @@ where
 mod trait_impls {
     use super::*;
     use crate::{
+        Persistable,
         journal::contiguous::Mutable,
         qmdb::any::traits::{
             BatchableDb, MerkleizedBatch as MerkleizedBatchTrait,
             UnmerkleizedBatch as UnmerkleizedBatchTrait,
         },
-        Persistable,
     };
     use std::future::Future;
 
@@ -1007,12 +1020,12 @@ mod trait_impls {
     }
 
     impl<
-            F: Graftable,
-            D: Digest,
-            U: update::Update + Send + Sync + 'static,
-            const N: usize,
-            S: Strategy,
-        > MerkleizedBatchTrait for Arc<MerkleizedBatch<F, D, U, N, S>>
+        F: Graftable,
+        D: Digest,
+        U: update::Update + Send + Sync + 'static,
+        const N: usize,
+        S: Strategy,
+    > MerkleizedBatchTrait for Arc<MerkleizedBatch<F, D, U, N, S>>
     where
         Operation<F, U>: Codec,
     {

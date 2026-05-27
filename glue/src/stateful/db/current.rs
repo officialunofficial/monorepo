@@ -106,6 +106,15 @@ where
         self.batch = self.batch.write(key, value);
         self
     }
+
+    /// The batch's effective pending overlay relative to committed DB state
+    /// (see the storage-layer `pending_overlay`): every key written by this
+    /// batch or an uncommitted ancestor, mapped to `Some(value)` (upsert) or
+    /// `None` (delete). Overlay a committed range stream with this to get a
+    /// parent-anchored prefix scan that matches [`get`](Self::get)'s read view.
+    pub fn pending_overlay(&self) -> std::collections::BTreeMap<K, Option<V::Value>> {
+        self.batch.pending_overlay()
+    }
 }
 
 /// Wraps a QMDB [`MerkleizedBatch`] with a reference to the parent
@@ -201,6 +210,15 @@ where
     pub fn write(mut self, key: K, value: Option<V::Value>) -> Self {
         self.batch = self.batch.write(key, value);
         self
+    }
+
+    /// The batch's effective pending overlay relative to committed DB state
+    /// (see the storage-layer `pending_overlay`): every key written by this
+    /// batch or an uncommitted ancestor, mapped to `Some(value)` (upsert) or
+    /// `None` (delete). Overlay a committed range stream with this to get a
+    /// parent-anchored prefix scan that matches [`get`](Self::get)'s read view.
+    pub fn pending_overlay(&self) -> std::collections::BTreeMap<K, Option<V::Value>> {
+        self.batch.pending_overlay()
     }
 }
 

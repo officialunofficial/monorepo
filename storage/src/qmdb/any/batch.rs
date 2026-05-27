@@ -1,6 +1,7 @@
 //! Batch mutation API for Any QMDBs.
 
 use crate::{
+    Context,
     index::{Ordered as OrderedIndex, Unordered as UnorderedIndex},
     journal::{
         authenticated,
@@ -9,10 +10,10 @@ use crate::{
     merkle::{Family, Location},
     qmdb::{
         any::{
-            db::Db,
-            operation::{update, Operation},
-            ordered::{find_next_key, find_prev_key},
             ValueEncoding,
+            db::Db,
+            operation::{Operation, update},
+            ordered::{find_next_key, find_prev_key},
         },
         batch_chain::{self, Bounds},
         bitmap::Shared,
@@ -20,7 +21,6 @@ use crate::{
         operation::{Key, Operation as OperationTrait},
         update_known_loc,
     },
-    Context,
 };
 use ahash::AHashSet;
 use commonware_codec::Codec;
@@ -969,6 +969,41 @@ where
         }
 
         Ok(results)
+    }
+
+    /// Collect the batch's effective pending overlay relative to committed DB
+    /// state: every key this batch (or an uncommitted ancestor) has written,
+    /// mapped to `Some(value)` for an upsert or `None` for a delete that hides a
+    /// committed entry.
+    ///
+    /// The result is the read-priority resolution of `get` flattened into a
+    /// single map: deepest ancestor first, then nearer ancestors, then the
+    /// immediate parent, then this batch's local mutations last — so the
+    /// highest-priority write for each key wins (matching `get`'s
+    /// `mutations -> parent.diff -> ancestor diffs -> db` order).
+    ///
+    /// This is the overlay a prefix scan must apply on top of the committed DB's
+    /// range stream to be parent-anchored and deterministic: `Some(v)` shadows
+    /// the committed value for that key; `None` hides it.
+    pub fn pending_overlay(&self) -> BTreeMap<U::Key, Option<U::Value>> {
+        let mut overlay: BTreeMap<U::Key, Option<U::Value>> = BTreeMap::new();
+        if let Some(parent) = self.base.parent() {
+            // Apply deepest ancestor first so nearer batches overwrite older
+            // entries for the same key (the inverse of `get`'s parent-first
+            // short-circuit, producing the identical winning value).
+            let mut chain: Vec<Arc<MerkleizedBatch<F, H::Digest, U, S>>> = vec![Arc::clone(parent)];
+            chain.extend(parent.ancestors());
+            for batch in chain.into_iter().rev() {
+                for (key, entry) in batch.diff.iter() {
+                    overlay.insert(key.clone(), entry.value().cloned());
+                }
+            }
+        }
+        // Local mutations are the highest priority; apply them last.
+        for (key, value) in &self.mutations {
+            overlay.insert(key.clone(), value.clone());
+        }
+        overlay
     }
 }
 
@@ -1999,16 +2034,16 @@ mod tests {
     use crate::{
         mmr,
         qmdb::any::{
+            BITMAP_CHUNK_BYTES,
             ordered::fixed::Db as OrderedFixedDb,
             test::{colliding_digest, fixed_db_config},
             unordered::fixed::Db as UnorderedFixedDb,
-            BITMAP_CHUNK_BYTES,
         },
         translator::OneCap,
     };
-    use commonware_cryptography::{sha256, Sha256};
+    use commonware_cryptography::{Sha256, sha256};
     use commonware_parallel::Sequential;
-    use commonware_runtime::{deterministic, Runner as _};
+    use commonware_runtime::{Runner as _, deterministic};
 
     const BITMAP_CHUNK_BITS: u64 = bitmap::Prunable::<BITMAP_CHUNK_BYTES>::CHUNK_SIZE_BITS;
 
