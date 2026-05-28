@@ -23,23 +23,23 @@
 //! [`await_or_cancel`].
 
 use crate::stateful::{
-    db::{Anchor, DatabaseSet},
     Application, Proposed,
+    db::{Anchor, DatabaseSet},
 };
 use commonware_consensus::{
+    Block, CertifiableBlock, Heightable, Roundable,
     marshal::{
+        Identifier,
         ancestry::BlockProvider,
         core::{Mailbox as MarshalMailbox, Variant as MarshalVariant},
-        Identifier,
     },
     types::{Height, Round},
-    Block, CertifiableBlock, Heightable, Roundable,
 };
-use commonware_cryptography::{certificate::Scheme, Digestible};
+use commonware_cryptography::{Digestible, certificate::Scheme};
 use commonware_macros::select;
-use commonware_runtime::{telemetry::metrics::GaugeExt, Clock, Metrics, Spawner};
+use commonware_runtime::{Clock, Metrics, Spawner, telemetry::metrics::GaugeExt};
 use commonware_utils::channel::{fallible::OneshotExt, oneshot};
-use futures::{stream, Stream, StreamExt};
+use futures::{Stream, StreamExt, stream};
 use rand::Rng;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -455,6 +455,30 @@ where
         let timer = self.metrics.rebuild_pending_duration.timer(context);
         let target_digest = target.digest();
 
+        // Early stale-fork rejection (#698, makechain prod): if `target` is at or
+        // below the last-processed height, it CANNOT be a valid parent for any
+        // future block — building a child on it would either re-do a finalized
+        // height (target.height < last_processed.height) or fork the chain
+        // (target.height == last_processed.height, different digest; same-digest
+        // was filtered by the `prepare_batches` call-site guard at line 417).
+        // Walking back through `subscribe_parent` on stale forks burns marshal
+        // round-trips and floods the log with the late "stale ancestry below
+        // processed height" warning — observed 882 hits per validator on
+        // consensus that keeps re-proposing nullified sibling blocks. Bailing
+        // here is the same return value (`Invalid`) as the late walk would
+        // produce, just without the IO + log spam.
+        if target.height() <= self.last_processed.height {
+            debug!(
+                ?target_digest,
+                target_height = target.height().get(),
+                last_processed_height = self.last_processed.height.get(),
+                last_processed = ?self.last_processed.digest,
+                "rebuild_pending: target at or below last-processed height — \
+                 stale fork, rejecting without walking ancestry"
+            );
+            return Err(PrepareBatchesError::Invalid);
+        }
+
         // Walk backward until we hit a known safe anchor.
         let mut replay_path = Vec::new();
         let mut cursor = target;
@@ -765,38 +789,38 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{await_or_cancel, next_or_cancel, FinalizeStatus, PrepareBatchesError, Processor};
+    use super::{FinalizeStatus, PrepareBatchesError, Processor, await_or_cancel, next_or_cancel};
     use crate::stateful::{
+        Application, Proposed,
         actor::processor::ProcessorMetrics,
         db::{Anchor, DatabaseSet, Merkleized as _, Unmerkleized as _},
-        Application, Proposed,
     };
     use commonware_codec::{Encode, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
     use commonware_consensus::{
+        Block as ConsensusBlock, CertifiableBlock, Heightable, Roundable,
         marshal::ancestry::BlockProvider,
         simplex::{mocks::scheme::Scheme as MockScheme, types::Context as ConsensusContext},
         types::{Epoch, Height, Round, View},
-        Block as ConsensusBlock, CertifiableBlock, Heightable, Roundable,
     };
     use commonware_cryptography::{
-        ed25519, sha256::Digest, Digest as _, Digestible, Hasher, Sha256, Signer as _,
+        Digest as _, Digestible, Hasher, Sha256, Signer as _, ed25519, sha256::Digest,
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{
-        buffer::paged::CacheRef, deterministic, ContextCell, Runner as _, Supervisor as _,
+        ContextCell, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
     };
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedLogConfig,
-        mmr::{self, full::Config as MmrJournalConfig, Location},
+        mmr::{self, Location, full::Config as MmrJournalConfig},
         qmdb::{any, sync::Target},
         translator::TwoCap,
     };
     use commonware_utils::{
+        NZU16, NZU64, NZUsize,
         channel::oneshot,
         non_empty_range,
         range::NonEmptyRange,
         sync::{AsyncRwLock, Mutex},
-        NZUsize, NZU16, NZU64,
     };
     use futures::{Stream, StreamExt};
     use std::{
@@ -804,8 +828,8 @@ mod tests {
         future::Future,
         num::NonZeroUsize,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 
@@ -1461,10 +1485,12 @@ mod tests {
 
             assert!(harness.processor.pending.contains_key(&winner.digest()));
             assert!(harness.processor.pending.contains_key(&loser.digest()));
-            assert!(harness
-                .processor
-                .pending
-                .contains_key(&loser_child.digest()));
+            assert!(
+                harness
+                    .processor
+                    .pending
+                    .contains_key(&loser_child.digest())
+            );
 
             let status = harness.finalize(winner.clone()).await;
             assert_eq!(
