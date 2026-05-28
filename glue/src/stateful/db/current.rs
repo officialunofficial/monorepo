@@ -418,9 +418,24 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
+        // After rewind, the (root, range.end) IS the state-defining invariant:
+        // ops in `[sync_boundary(), bounds.end)` produce `ops_root()`. The
+        // `range.start` (== `sync_boundary()`) is the inactivity floor, which
+        // advances monotonically as ops are pruned and CANNOT be reversed — a
+        // rewind cannot "un-prune" to expose history below the current floor.
+        // Asserting `rewound_target == target` therefore over-constrains: when
+        // the target was constructed against a DB with a lower floor (e.g. a
+        // freshly-started peer at floor 0) and the local DB has since advanced
+        // its floor, the (root, end) match but `start` differs and the
+        // assertion panics — even though the post-rewind state is correct.
+        // Compare only the state-defining tuple. (Makechain prod hit this on
+        // the rewind path with same-root, range Location(256)..Location(490)
+        // vs target Location(0)..Location(490).)
         assert_eq!(
-            rewound_target, target,
-            "rewound database target mismatch after rewind",
+            (rewound_target.root, rewound_target.range.end()),
+            (target.root, target.range.end()),
+            "rewound database target mismatch after rewind: root or range end differ \
+             (range.start = sync_boundary is intentionally floor-relative and not asserted)",
         );
         Ok(())
     }
@@ -588,9 +603,24 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
+        // After rewind, the (root, range.end) IS the state-defining invariant:
+        // ops in `[sync_boundary(), bounds.end)` produce `ops_root()`. The
+        // `range.start` (== `sync_boundary()`) is the inactivity floor, which
+        // advances monotonically as ops are pruned and CANNOT be reversed — a
+        // rewind cannot "un-prune" to expose history below the current floor.
+        // Asserting `rewound_target == target` therefore over-constrains: when
+        // the target was constructed against a DB with a lower floor (e.g. a
+        // freshly-started peer at floor 0) and the local DB has since advanced
+        // its floor, the (root, end) match but `start` differs and the
+        // assertion panics — even though the post-rewind state is correct.
+        // Compare only the state-defining tuple. (Makechain prod hit this on
+        // the rewind path with same-root, range Location(256)..Location(490)
+        // vs target Location(0)..Location(490).)
         assert_eq!(
-            rewound_target, target,
-            "rewound database target mismatch after rewind",
+            (rewound_target.root, rewound_target.range.end()),
+            (target.root, target.range.end()),
+            "rewound database target mismatch after rewind: root or range end differ \
+             (range.start = sync_boundary is intentionally floor-relative and not asserted)",
         );
         Ok(())
     }
@@ -684,9 +714,24 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
+        // After rewind, the (root, range.end) IS the state-defining invariant:
+        // ops in `[sync_boundary(), bounds.end)` produce `ops_root()`. The
+        // `range.start` (== `sync_boundary()`) is the inactivity floor, which
+        // advances monotonically as ops are pruned and CANNOT be reversed — a
+        // rewind cannot "un-prune" to expose history below the current floor.
+        // Asserting `rewound_target == target` therefore over-constrains: when
+        // the target was constructed against a DB with a lower floor (e.g. a
+        // freshly-started peer at floor 0) and the local DB has since advanced
+        // its floor, the (root, end) match but `start` differs and the
+        // assertion panics — even though the post-rewind state is correct.
+        // Compare only the state-defining tuple. (Makechain prod hit this on
+        // the rewind path with same-root, range Location(256)..Location(490)
+        // vs target Location(0)..Location(490).)
         assert_eq!(
-            rewound_target, target,
-            "rewound database target mismatch after rewind",
+            (rewound_target.root, rewound_target.range.end()),
+            (target.root, target.range.end()),
+            "rewound database target mismatch after rewind: root or range end differ \
+             (range.start = sync_boundary is intentionally floor-relative and not asserted)",
         );
         Ok(())
     }
