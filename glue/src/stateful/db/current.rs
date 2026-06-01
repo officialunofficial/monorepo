@@ -11,7 +11,7 @@ use crate::stateful::db::{
     Unmerkleized as UnmerkleizedTrait,
 };
 use commonware_codec::{Codec, Read as CodecRead};
-use commonware_cryptography::Hasher;
+use commonware_cryptography::{Digest, Hasher};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
@@ -46,6 +46,17 @@ use std::{ops::Deref, sync::Arc};
 
 type CurrentDbHandle<F, E, C, I, H, U, const N: usize, S> =
     Arc<AsyncRwLock<Db<F, E, C, I, H, U, N, S>>>;
+
+fn current_committed_target_equivalent<F, D>(
+    actual: &CurrentSyncTarget<F, D>,
+    expected: &CurrentSyncTarget<F, D>,
+) -> bool
+where
+    F: Graftable,
+    D: Digest + PartialEq,
+{
+    actual.root == expected.root && actual.range.end() == expected.range.end()
+}
 
 /// Wraps a QMDB [`UnmerkleizedBatch`] with a reference to the parent
 /// database, implementing the [`Unmerkleized`](super::Unmerkleized) trait.
@@ -381,6 +392,13 @@ where
             && *target.range.end() == Location::<F>::new(batch.bounds().total_size)
     }
 
+    fn committed_target_equivalent(
+        actual: &Self::SyncTarget,
+        expected: &Self::SyncTarget,
+    ) -> bool {
+        current_committed_target_equivalent(actual, expected)
+    }
+
     async fn finalize(&mut self, batch: Self::Merkleized) -> Result<(), Error<F>> {
         self.apply_batch(batch.inner).await?;
         self.sync().await?;
@@ -400,8 +418,8 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
-        assert_eq!(
-            rewound_target, target,
+        assert!(
+            Self::committed_target_equivalent(&rewound_target, &target),
             "rewound database target mismatch after rewind",
         );
         Ok(())
@@ -472,6 +490,13 @@ where
             && *target.range.end() == Location::<F>::new(batch.bounds().total_size)
     }
 
+    fn committed_target_equivalent(
+        actual: &Self::SyncTarget,
+        expected: &Self::SyncTarget,
+    ) -> bool {
+        current_committed_target_equivalent(actual, expected)
+    }
+
     async fn finalize(&mut self, batch: Self::Merkleized) -> Result<(), Error<F>> {
         self.apply_batch(batch.inner).await?;
         self.sync().await?;
@@ -491,8 +516,8 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
-        assert_eq!(
-            rewound_target, target,
+        assert!(
+            Self::committed_target_equivalent(&rewound_target, &target),
             "rewound database target mismatch after rewind",
         );
         Ok(())
@@ -640,6 +665,13 @@ where
             && *target.range.end() == Location::<F>::new(batch.bounds().total_size)
     }
 
+    fn committed_target_equivalent(
+        actual: &Self::SyncTarget,
+        expected: &Self::SyncTarget,
+    ) -> bool {
+        current_committed_target_equivalent(actual, expected)
+    }
+
     async fn finalize(&mut self, batch: Self::Merkleized) -> Result<(), Error<F>> {
         self.apply_batch(batch.inner).await?;
         self.sync().await?;
@@ -659,8 +691,8 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
-        assert_eq!(
-            rewound_target, target,
+        assert!(
+            Self::committed_target_equivalent(&rewound_target, &target),
             "rewound database target mismatch after rewind",
         );
         Ok(())
@@ -736,6 +768,13 @@ where
             && *target.range.end() == Location::<F>::new(batch.bounds().total_size)
     }
 
+    fn committed_target_equivalent(
+        actual: &Self::SyncTarget,
+        expected: &Self::SyncTarget,
+    ) -> bool {
+        current_committed_target_equivalent(actual, expected)
+    }
+
     async fn finalize(&mut self, batch: Self::Merkleized) -> Result<(), Error<F>> {
         self.apply_batch(batch.inner).await?;
         self.sync().await?;
@@ -755,8 +794,8 @@ where
         self.sync().await?;
 
         let rewound_target = self.sync_target().await;
-        assert_eq!(
-            rewound_target, target,
+        assert!(
+            Self::committed_target_equivalent(&rewound_target, &target),
             "rewound database target mismatch after rewind",
         );
         Ok(())
@@ -1329,12 +1368,14 @@ mod tests {
             let db = Arc::new(AsyncRwLock::new(db));
 
             let key = Sha256::hash(b"key");
+            let key2 = Sha256::hash(b"key2");
             let value = Sha256::hash(b"value");
             let metadata = Sha256::hash(b"metadata");
 
             let batch = <FixedDb as ManagedDb<_>>::new_batch(&db)
                 .await
                 .write(key, Some(value))
+                .write(key2, Some(value))
                 .with_metadata(metadata);
             let merkleized = crate::stateful::db::Unmerkleized::merkleize(batch)
                 .await
@@ -1355,11 +1396,29 @@ mod tests {
                 &valid_target,
             ));
 
+            let mut wrong_start = valid_target.clone();
+            wrong_start.range = non_empty_range!(
+                mmr::Location::new(*valid_target.range.start() + 1),
+                mmr::Location::new(*valid_target.range.end())
+            );
+            assert!(!<FixedDb as ManagedDb<_>>::matches_sync_target(
+                &merkleized,
+                &wrong_start,
+            ));
+            assert!(<FixedDb as ManagedDb<_>>::committed_target_equivalent(
+                &wrong_start,
+                &valid_target,
+            ));
+
             let mut wrong_root = valid_target.clone();
             wrong_root.root = Sha256::hash(b"wrong ops root");
             assert!(!<FixedDb as ManagedDb<_>>::matches_sync_target(
                 &merkleized,
                 &wrong_root,
+            ));
+            assert!(!<FixedDb as ManagedDb<_>>::committed_target_equivalent(
+                &wrong_root,
+                &valid_target,
             ));
 
             let mut wrong_range = valid_target.clone();
@@ -1370,6 +1429,10 @@ mod tests {
             assert!(!<FixedDb as ManagedDb<_>>::matches_sync_target(
                 &merkleized,
                 &wrong_range,
+            ));
+            assert!(!<FixedDb as ManagedDb<_>>::committed_target_equivalent(
+                &wrong_range,
+                &valid_target,
             ));
         });
     }
