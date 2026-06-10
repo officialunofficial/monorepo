@@ -833,9 +833,18 @@ where
     }
 
     /// Return the batch's safe sync boundary.
+    ///
+    /// Derived from the chunk-aligned inactivity floor declared by this batch's
+    /// commit — the same quantity [`super::Db::sync_boundary`] recovers after a
+    /// reopen — NOT from `bitmap.pruned_chunks()`. The two must agree: targets
+    /// recorded from a merkleized batch (e.g. stamped into a block header by a
+    /// `glue` application) are compared against the reopened database's
+    /// boundary at startup, and `pruned_chunks` lags the inactivity floor
+    /// whenever pruning has not kept pace (or is disabled), making every
+    /// restart fail that comparison once the floor crosses a chunk.
     pub fn sync_boundary(&self) -> Location<F> {
         super::db::sync_boundary::<F, N>(
-            self.bitmap.pruned_chunks() as u64,
+            *self.inner.bounds().inactivity_floor / bitmap::Prunable::<N>::CHUNK_SIZE_BITS,
             self.inner.bounds().total_size,
         )
     }

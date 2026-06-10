@@ -168,6 +168,61 @@ pub mod test {
         });
     }
 
+    /// Regression: the boundary recorded from a merkleized batch (e.g. stamped
+    /// into block headers by `glue` applications) must equal the boundary the
+    /// reopened database reports. The batch previously derived it from
+    /// `bitmap.pruned_chunks()` (0 whenever pruning has not run) while the
+    /// reopened db derives it from the recovered inactivity floor — so every
+    /// restart after the floor crossed one chunk failed startup target
+    /// reconciliation.
+    #[test_traced("INFO")]
+    pub fn test_merkleized_batch_sync_boundary_survives_reopen() {
+        deterministic::Runner::default().start(|ctx| async move {
+            let partition = "batch-boundary-reopen".to_string();
+            let mut db = open_db(ctx.child("current"), partition.clone()).await;
+
+            // Update the same key across many commits WITHOUT pruning so the
+            // inactivity floor advances past one bitmap chunk (256 ops at
+            // N=32) while pruned_chunks stays 0.
+            let key = Sha256::fill(1u8);
+            let mut last_batch_boundary = mmr::Location::new(0);
+            for i in 0..200u8 {
+                let value = Sha256::fill(i);
+                let batch = db
+                    .new_batch()
+                    .write(key, Some(value))
+                    .merkleize(&db, None)
+                    .await
+                    .unwrap();
+                last_batch_boundary = batch.sync_boundary();
+                db.apply_batch(batch).await.unwrap();
+            }
+            db.sync().await.unwrap();
+
+            // Precondition: the floor actually crossed a chunk, otherwise the
+            // test is vacuous.
+            assert!(
+                *last_batch_boundary > 0,
+                "inactivity floor never crossed a chunk; add more commits"
+            );
+            assert_eq!(
+                db.sync_boundary(),
+                last_batch_boundary,
+                "live db boundary disagrees with the last merkleized batch"
+            );
+
+            drop(db);
+            let db = open_db(ctx.child("reopen"), partition).await;
+            assert_eq!(
+                db.sync_boundary(),
+                last_batch_boundary,
+                "reopened db boundary disagrees with the boundary recorded \
+                 from the last merkleized batch"
+            );
+            db.destroy().await.unwrap();
+        });
+    }
+
     #[test_traced("DEBUG")]
     pub fn test_current_db_verify_proof_over_bits_in_uncommitted_chunk() {
         shared::test_verify_proof_over_bits_in_uncommitted_chunk(open_db);
